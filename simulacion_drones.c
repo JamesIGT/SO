@@ -31,9 +31,11 @@
 // Tipos de comandos
 enum {
     CMD_NONE = 0,
+    CMD_TAKEOFF = 10,       // Orden de despegue
     CMD_PROCEED = 1,        // Ensamble -> Re-ensamble
     CMD_GO_ATTACK = 2,      // Re-ensamble -> Objetivo
     CMD_SET_SWARM = 3,      // Reasignación de enjambre (data = nuevo swarm)
+    CMD_SET_TARGET = 4,     // data=x, data2=y
     CMD_SHUTDOWN = 99
 };
 
@@ -45,11 +47,19 @@ enum {
     EVT_DESTROYED = 4,      // Derribado por defensa
     EVT_DETONATED = 5,      // Bomba detonada
     EVT_FUEL_EMPTY = 6,     // Combustible agotado
-    EVT_CAM_REPORT = 7      // Informe cámara
+    EVT_CAM_REPORT = 7,     // Informe cámara
+    EVT_HEARTBEAT = 8,      // Latido de enlace
+    EVT_LINK_LOST = 9,      // Enlace perdido
+    EVT_LINK_RESTORED = 10, // Enlace restablecido
+    EVT_DRONE_LOST = 11     // Dron dado por perdido
 };
 
-// Probabilidad de derribo por defensa (0..100)
+// Probabilidad de derribo por defensa (0..100) [por defecto]
 #define DEFENSA_PROB_PCT 25
+// Probabilidad de pérdida de enlace Q% (0..100) [por defecto]
+#define LINK_LOSS_Q_PCT_DEFAULT 5
+// Timeout Z para reconexión (segundos) [por defecto]
+#define RECONNECT_TIMEOUT_SEC_DEFAULT 5
 
 // Combustible por dron (ticks)
 #define COMBUSTIBLE_INICIAL 600
@@ -96,6 +106,8 @@ struct DroneShared {
     int ready;         // 1 si listo en ensamble
     int detonated;     // 1 si detonó
     int fuel;          // combustible restante
+    int distance;      // distancia acumulada (unidades)
+    int link_ok;       // estado de enlace simulado 1/0
 };
 
 // ------------------------
@@ -133,6 +145,31 @@ static struct DroneShared *g_shared = NULL;
 // Utilidades
 static inline int min_int(int a, int b) { return a < b ? a : b; }
 static inline int max_int(int a, int b) { return a > b ? a : b; }
+static inline int clamp_int(int v, int lo, int hi) { return v < lo ? lo : (v > hi ? hi : v); }
+
+// Parámetros en tiempo de ejecución (config)
+static int g_defensa_prob_pct = DEFENSA_PROB_PCT;
+static int g_link_loss_q_pct = LINK_LOSS_Q_PCT_DEFAULT;
+static int g_reconnect_timeout_sec = RECONNECT_TIMEOUT_SEC_DEFAULT;
+
+static void cargar_configuracion(void) {
+    const char *paths[2] = { "/workspace/drones.conf", "./drones.conf" };
+    for (int p = 0; p < 2; p++) {
+        FILE *f = fopen(paths[p], "r");
+        if (!f) continue;
+        char line[256];
+        while (fgets(line, sizeof(line), f)) {
+            char key[64];
+            int val;
+            if (sscanf(line, " %63[^=]=%d", key, &val) == 2) {
+                if (strcmp(key, "W") == 0) g_defensa_prob_pct = clamp_int(val, 0, 100);
+                else if (strcmp(key, "Q") == 0) g_link_loss_q_pct = clamp_int(val, 0, 100);
+                else if (strcmp(key, "Z") == 0) g_reconnect_timeout_sec = clamp_int(val, 1, 60);
+            }
+        }
+        fclose(f);
+    }
+}
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -266,6 +303,8 @@ static void init_shared(void) {
         g_shared[i].ready = 0;
         g_shared[i].detonated = 0;
         g_shared[i].fuel = 0;
+        g_shared[i].distance = 0;
+        g_shared[i].link_ok = 1;
     }
 }
 
@@ -287,20 +326,28 @@ struct DroneCtx {
     int cmd_fd;       // FIFO comandos (lectura)
     volatile int proceed_allowed;
     volatile int attack_allowed;
+    volatile int takeoff_allowed;
     volatile int alive;
     volatile int at_target;
     int center_fd;    // FIFO eventos (escritura)
+    volatile int link_ok;
+    int target_x;
+    int target_y;
 };
 
 static void *hilo_combustible(void *arg) {
     struct DroneCtx *ctx = (struct DroneCtx *)arg;
     int idx = idx_for_drone(ctx->drone_id);
     if (idx < 0) return NULL;
+    int last_distance = 0;
     while (ctx->alive) {
         usleep(TICK_USEC);
         if (!ctx->alive) break;
-        int fuel = g_shared[idx].fuel;
-        fuel = max_int(0, fuel - 1);
+        int current_distance = g_shared[idx].distance;
+        int delta = max_int(0, current_distance - last_distance);
+        last_distance = current_distance;
+        int fuel = g_shared[idx].fuel - delta;
+        fuel = max_int(0, fuel);
         g_shared[idx].fuel = fuel;
         if (fuel == 0) {
             ctx->alive = 0;
@@ -319,8 +366,10 @@ static void mover_hacia(struct DroneCtx *ctx, int dest_x, int dest_y) {
         int dx = dest_x - g_shared[idx].x;
         int dy = dest_y - g_shared[idx].y;
         if (dx == 0 && dy == 0) break;
-        if (dx != 0) g_shared[idx].x += (dx > 0 ? 1 : -1) * min_int(abs(dx), VELOCIDAD_POR_TICK);
-        if (dy != 0) g_shared[idx].y += (dy > 0 ? 1 : -1) * min_int(abs(dy), VELOCIDAD_POR_TICK);
+        int step_x = 0, step_y = 0;
+        if (dx != 0) { step_x = (dx > 0 ? 1 : -1) * min_int(abs(dx), VELOCIDAD_POR_TICK); g_shared[idx].x += step_x; }
+        if (dy != 0) { step_y = (dy > 0 ? 1 : -1) * min_int(abs(dy), VELOCIDAD_POR_TICK); g_shared[idx].y += step_y; }
+        g_shared[idx].distance += abs(step_x) + abs(step_y);
         // Chequear si defensa lo destruyó
         if (!g_shared[idx].alive) {
             ctx->alive = 0;
@@ -330,19 +379,51 @@ static void mover_hacia(struct DroneCtx *ctx, int dest_x, int dest_y) {
     }
 }
 
+static void loiter_en_circulos(struct DroneCtx *ctx, int cx, int cy, int radio, int vueltas_minimas) {
+    int idx = idx_for_drone(ctx->drone_id);
+    if (idx < 0) return;
+    int pasos = 0;
+    int perimetro = radio * 8; // aproximación cuadrada
+    int fase = 0;
+    while (ctx->alive && !ctx->proceed_allowed) {
+        int x = g_shared[idx].x;
+        int y = g_shared[idx].y;
+        int tx = x, ty = y;
+        switch ((fase / radio) % 4) {
+            case 0: tx = min_int(cx + radio, x + 1); break;
+            case 1: ty = min_int(cy + radio, y + 1); break;
+            case 2: tx = max_int(cx - radio, x - 1); break;
+            case 3: ty = max_int(cy - radio, y - 1); break;
+        }
+        mover_hacia(ctx, tx, ty);
+        pasos++;
+        fase++;
+        if (vueltas_minimas > 0 && pasos > perimetro * vueltas_minimas) vueltas_minimas = 0;
+        usleep(TICK_USEC);
+    }
+}
+
 static void *hilo_comunicacion(void *arg) {
     struct DroneCtx *ctx = (struct DroneCtx *)arg;
+    int link_down_since = 0;
     for (;;) {
         struct DroneCommand cmd;
         ssize_t r = read(ctx->cmd_fd, &cmd, sizeof(cmd));
         if (r == sizeof(cmd)) {
-            if (cmd.cmd == CMD_PROCEED) ctx->proceed_allowed = 1;
+            if (!ctx->link_ok) {
+                // Ignora comandos cuando no hay enlace
+            } else if (cmd.cmd == CMD_TAKEOFF) {
+                ctx->takeoff_allowed = 1;
+            } else if (cmd.cmd == CMD_PROCEED) ctx->proceed_allowed = 1;
             else if (cmd.cmd == CMD_GO_ATTACK) ctx->attack_allowed = 1;
             else if (cmd.cmd == CMD_SET_SWARM) {
                 int idx = idx_for_drone(ctx->drone_id);
                 if (idx >= 0) {
                     g_shared[idx].swarm_id = cmd.data;
                 }
+            } else if (cmd.cmd == CMD_SET_TARGET) {
+                ctx->target_x = cmd.data;
+                ctx->target_y = cmd.data2;
             } else if (cmd.cmd == CMD_SHUTDOWN) {
                 ctx->alive = 0;
                 int idx = idx_for_drone(ctx->drone_id);
@@ -363,6 +444,40 @@ static void *hilo_comunicacion(void *arg) {
                 if (ctx->cmd_fd < 0) break;
             } else {
                 usleep(100000);
+            }
+        }
+        // Simular pérdida de enlace con probabilidad Q% por segundo
+        static const int period_ticks = 20; // ~1s si TICK_USEC=50ms
+        static __thread int tick_counter = 0;
+        tick_counter++;
+        if (tick_counter >= period_ticks) {
+            tick_counter = 0;
+            if (ctx->link_ok) {
+                int r = rand() % 100;
+                if (r < g_link_loss_q_pct) {
+                    ctx->link_ok = 0;
+                    int idx = idx_for_drone(ctx->drone_id);
+                    if (idx >= 0) g_shared[idx].link_ok = 0;
+                    write_event_fd(ctx->center_fd, EVT_LINK_LOST, ctx->drone_id, (idx>=0?g_shared[idx].swarm_id:-1), 0, "link down");
+                    link_down_since = (int)time(NULL);
+                }
+            } else {
+                int r2 = rand() % 100;
+                if (r2 < 50) {
+                    ctx->link_ok = 1;
+                    int idx = idx_for_drone(ctx->drone_id);
+                    if (idx >= 0) g_shared[idx].link_ok = 1;
+                    write_event_fd(ctx->center_fd, EVT_LINK_RESTORED, ctx->drone_id, (idx>=0?g_shared[idx].swarm_id:-1), 0, "link up");
+                } else {
+                    if ((int)time(NULL) - link_down_since >= g_reconnect_timeout_sec) {
+                        // Pérdida del drone
+                        ctx->alive = 0;
+                        int idx = idx_for_drone(ctx->drone_id);
+                        if (idx >= 0) g_shared[idx].alive = 0;
+                        write_event_fd(ctx->center_fd, EVT_DRONE_LOST, ctx->drone_id, (idx>=0?g_shared[idx].swarm_id:-1), 0, "lost");
+                        break;
+                    }
+                }
             }
         }
         if (!ctx->alive) break;
@@ -426,6 +541,9 @@ static void *hilo_navegacion(void *arg) {
     int idx = idx_for_drone(ctx->drone_id);
     if (idx < 0) return NULL;
 
+    // Espera despegue
+    while (ctx->alive && !ctx->takeoff_allowed) usleep(100000);
+
     // 1) Camión -> Ensamble
     struct Punto pe = puntos_ensamblaje[g_shared[idx].swarm_id];
     mover_hacia(ctx, pe.x, pe.y);
@@ -434,8 +552,10 @@ static void *hilo_navegacion(void *arg) {
         write_event_fd(ctx->center_fd, EVT_READY, ctx->drone_id, g_shared[idx].swarm_id, 0, "READY ensamble");
     }
 
-    // 2) Espera CMD_PROCEED y avanza hasta re-ensamble
-    while (ctx->alive && !ctx->proceed_allowed) usleep(100000);
+    // 2) Loiter en círculo hasta que el enjambre esté completo
+    loiter_en_circulos(ctx, pe.x, pe.y, 2, 1);
+
+    // 2b) Avanza hasta re-ensamble
     struct Punto pr = puntos_reensamblaje[g_shared[idx].swarm_id];
     mover_hacia(ctx, pr.x, pr.y);
     if (ctx->alive) {
@@ -444,8 +564,13 @@ static void *hilo_navegacion(void *arg) {
 
     // 3) Espera CMD_GO_ATTACK y avanza al objetivo
     while (ctx->alive && !ctx->attack_allowed) usleep(100000);
-    struct Punto po = puntos_objetivo[g_shared[idx].swarm_id];
-    mover_hacia(ctx, po.x, po.y);
+    int tx = ctx->target_x;
+    int ty = ctx->target_y;
+    if (ty <= 0) { // fallback
+        struct Punto po = puntos_objetivo[g_shared[idx].swarm_id];
+        tx = po.x; ty = po.y;
+    }
+    mover_hacia(ctx, tx, ty);
     if (ctx->alive) {
         ctx->at_target = 1;
         write_event_fd(ctx->center_fd, EVT_AT_TARGET, ctx->drone_id, g_shared[idx].swarm_id, 0, "En objetivo");
@@ -497,6 +622,8 @@ static void proceso_dron(int drone_id, int swarm_id_inicial, int es_camara) {
     g_shared[slot].ready = 0;
     g_shared[slot].detonated = 0;
     g_shared[slot].fuel = COMBUSTIBLE_INICIAL;
+    g_shared[slot].distance = 0;
+    g_shared[slot].link_ok = 1;
 
     int cmd_fd = -1;
     crear_fifo_comandos_dron(drone_id, &cmd_fd);
@@ -509,10 +636,14 @@ static void proceso_dron(int drone_id, int swarm_id_inicial, int es_camara) {
     ctx.is_camera = es_camara;
     ctx.proceed_allowed = 0;
     ctx.attack_allowed = 0;
+    ctx.takeoff_allowed = 0;
     ctx.alive = 1;
     ctx.at_target = 0;
     ctx.cmd_fd = cmd_fd;
     ctx.center_fd = center_fd;
+    ctx.link_ok = 1;
+    ctx.target_x = puntos_objetivo[swarm_id_inicial].x;
+    ctx.target_y = puntos_objetivo[swarm_id_inicial].y;
 
     pthread_t th_nav, th_fuel, th_comm, th_role;
     pthread_create(&th_comm, NULL, hilo_comunicacion, &ctx);
@@ -610,42 +741,60 @@ static void difundir_a_todos(int cmd) {
     }
 }
 
+// Retasking: alternado izquierda/derecha desde cada enjambre incompleto, exclusivamente
 static void retask_reensamble(void) {
-    // Rebalancear: si un enjambre < 5 y otro > 5, mover drones sobrantes
     int conteo[NUM_ENJAMBRES] = {0};
+    int locked[TOTAL_DRONES] = {0};
     for (int i = 0; i < TOTAL_DRONES; i++) {
         if (!g_shared[i].active) continue;
         if (!g_shared[i].alive) continue;
-        // Considerar drones que llegaron a re-ensamble (y >= 66)
-        if (g_shared[i].y >= ZONA_DEFENSA_MAX) {
-            conteo[g_shared[i].swarm_id]++;
-        }
+        if (g_shared[i].y >= ZONA_DEFENSA_MAX) conteo[g_shared[i].swarm_id]++;
     }
+    // Para cada swarm incompleto, buscar donantes alternando offsets 1, -1, 2, -2, ...
     for (int s_need = 0; s_need < NUM_ENJAMBRES; s_need++) {
         while (conteo[s_need] < DRONES_POR_ENJAMBRE) {
-            int donor = -1;
-            for (int s_give = 0; s_give < NUM_ENJAMBRES; s_give++) {
-                if (conteo[s_give] > DRONES_POR_ENJAMBRE) {
-                    // Encuentra un dron donante
+            int found = 0;
+            for (int off = 1; off < NUM_ENJAMBRES && conteo[s_need] < DRONES_POR_ENJAMBRE; off++) {
+                int cand[2] = { s_need - off, s_need + off };
+                for (int c = 0; c < 2; c++) {
+                    int s_give = cand[c];
+                    if (s_give < 0 || s_give >= NUM_ENJAMBRES) continue;
+                    if (conteo[s_give] <= DRONES_POR_ENJAMBRE) continue; // no extraer de completos o deficitarios
+                    // elegir un dron donante no cámara y no bloqueado
+                    int donor = -1;
                     for (int i = 0; i < TOTAL_DRONES; i++) {
                         if (!g_shared[i].active) continue;
                         if (!g_shared[i].alive) continue;
                         if (g_shared[i].swarm_id != s_give) continue;
-                        if (g_shared[i].y >= ZONA_DEFENSA_MAX) { donor = i; break; }
+                        if (g_shared[i].y < ZONA_DEFENSA_MAX) continue; // sólo los que llegaron a re-ensamble
+                        if (g_shared[i].is_camera) continue; // preferir no mover cámara
+                        if (locked[i]) continue;
+                        donor = i; break;
+                    }
+                    if (donor < 0) {
+                        for (int i = 0; i < TOTAL_DRONES; i++) {
+                            if (!g_shared[i].active) continue;
+                            if (!g_shared[i].alive) continue;
+                            if (g_shared[i].swarm_id != s_give) continue;
+                            if (g_shared[i].y < ZONA_DEFENSA_MAX) continue;
+                            if (locked[i]) continue;
+                            donor = i; break; // como fallback, incluso cámara
+                        }
                     }
                     if (donor >= 0) {
                         int drone_id = g_shared[donor].drone_id;
+                        locked[donor] = 1; // exclusividad
                         enviar_comando(drone_id, CMD_SET_SWARM, s_need, 0);
                         g_shared[donor].swarm_id = s_need;
                         conteo[s_give]--;
                         conteo[s_need]++;
-                        donor = -1;
-                        continue;
+                        found = 1;
+                        if (conteo[s_need] >= DRONES_POR_ENJAMBRE) break;
                     }
                 }
+                if (found && conteo[s_need] >= DRONES_POR_ENJAMBRE) break;
             }
-            // No hay donantes
-            break;
+            if (!found) break; // no más donantes
         }
     }
 }
@@ -660,12 +809,13 @@ static void centro_de_comando(void) {
     create_or_attach_shm(1);
     init_shared();
     int fd_evt = open_center_fifo_reader();
+    cargar_configuracion();
 
     // Lanzar defensas
     pid_t d1 = fork();
-    if (d1 == 0) defensa_main(10, 100, DEFENSA_PROB_PCT);
+    if (d1 == 0) defensa_main(10, 100, g_defensa_prob_pct);
     pid_t d2 = fork();
-    if (d2 == 0) defensa_main(90, 100, DEFENSA_PROB_PCT);
+    if (d2 == 0) defensa_main(90, 100, g_defensa_prob_pct);
 
     // Lanzar enjambres (camiones)
     for (int s = 0; s < NUM_ENJAMBRES; s++) {
@@ -682,7 +832,43 @@ static void centro_de_comando(void) {
     int have_sent_attack = 0;
     int cam_reports[NUM_ENJAMBRES] = {0};
 
+    // Asignación aleatoria de objetivos por ola
+    int target_x[NUM_ENJAMBRES];
+    int target_y[NUM_ENJAMBRES];
+    for (int s = 0; s < NUM_ENJAMBRES; s++) {
+        target_x[s] = puntos_objetivo[s].x;
+        target_y[s] = puntos_objetivo[s].y;
+    }
+
+    // Enviar TAKEOFF a todos al inicio
+    fprintf(stderr, "[Centro] CMD_TAKEOFF\n");
+    for (int i = 0; i < TOTAL_DRONES; i++) if (g_shared[i].active) enviar_comando(g_shared[i].drone_id, CMD_TAKEOFF, 0, 0);
+
     time_t start = time(NULL);
+
+    // Hilo de display de estado
+    pthread_t th_disp;
+    void *display_fn(void *arg) {
+        (void)arg;
+        for (;;) {
+            usleep(500000);
+            fprintf(stderr, "\n===== ESTADO =====\n");
+            for (int s = 0; s < NUM_ENJAMBRES; s++) {
+                int vivos = 0, listos = 0, en_re = 0, deton = 0;
+                for (int i = 0; i < TOTAL_DRONES; i++) {
+                    if (!g_shared[i].active) continue;
+                    if (g_shared[i].swarm_id != s) continue;
+                    if (g_shared[i].alive) vivos++;
+                    if (g_shared[i].ready) listos++;
+                    if (g_shared[i].y >= ZONA_DEFENSA_MAX) en_re++;
+                    if (g_shared[i].detonated) deton++;
+                }
+                fprintf(stderr, "Enjambre %d: vivos=%d listos=%d re-ens=%d det=%d\n", s+1, vivos, listos, en_re, deton);
+            }
+        }
+        return NULL;
+    }
+    pthread_create(&th_disp, NULL, display_fn, NULL);
 
     for (;;) {
         struct CenterEvent evt;
@@ -709,6 +895,12 @@ static void centro_de_comando(void) {
             } else if (evt.type == EVT_CAM_REPORT) {
                 fprintf(stderr, "[Centro] Cámara %d reporte: %s (enjambre %d)\n", evt.drone_id, evt.data ? "DESTRUIDO" : "PARCIAL", evt.swarm_id + 1);
                 cam_reports[evt.swarm_id] = evt.data ? 1 : 0;
+            } else if (evt.type == EVT_LINK_LOST) {
+                fprintf(stderr, "[Centro] Enlace PERDIDO con dron %d (enjambre %d)\n", evt.drone_id, evt.swarm_id + 1);
+            } else if (evt.type == EVT_LINK_RESTORED) {
+                fprintf(stderr, "[Centro] Enlace RESTAURADO con dron %d (enjambre %d)\n", evt.drone_id, evt.swarm_id + 1);
+            } else if (evt.type == EVT_DRONE_LOST) {
+                fprintf(stderr, "[Centro] Dron %d dado por PERDIDO (enjambre %d)\n", evt.drone_id, evt.swarm_id + 1);
             }
         } else {
             usleep(50000);
@@ -734,7 +926,26 @@ static void centro_de_comando(void) {
             for (int i = 0; i < TOTAL_DRONES; i++) if (g_shared[i].active && g_shared[i].alive) alive_total++;
             for (int s = 0; s < NUM_ENJAMBRES; s++) arrived += reassembly_arrived[s];
             if (arrived >= max_int(1, alive_total / 2) || time(NULL) - start > 10) {
+                // Reasignación de enjambres incompletos
                 retask_reensamble();
+                // Objetivos aleatorios por enjambre (barajar posiciones X)
+                int order[NUM_ENJAMBRES];
+                for (int s = 0; s < NUM_ENJAMBRES; s++) order[s] = s;
+                for (int i = NUM_ENJAMBRES - 1; i > 0; i--) {
+                    int j = rand() % (i + 1);
+                    int tmp = order[i]; order[i] = order[j]; order[j] = tmp;
+                }
+                for (int s = 0; s < NUM_ENJAMBRES; s++) {
+                    int tgt = order[s];
+                    target_x[s] = puntos_objetivo[tgt].x;
+                    target_y[s] = puntos_objetivo[tgt].y;
+                }
+                // Enviar objetivos a drones por enjambre y GO_ATTACK
+                for (int i = 0; i < TOTAL_DRONES; i++) {
+                    if (!g_shared[i].active) continue;
+                    int s = g_shared[i].swarm_id;
+                    enviar_comando(g_shared[i].drone_id, CMD_SET_TARGET, target_x[s], target_y[s]);
+                }
                 fprintf(stderr, "[Centro] CMD_GO_ATTACK\n");
                 difundir_a_todos(CMD_GO_ATTACK);
                 have_sent_attack = 1;
@@ -758,6 +969,7 @@ static void centro_de_comando(void) {
 
     // Apagar drones
     difundir_a_todos(CMD_SHUTDOWN);
+    pthread_cancel(th_disp);
     // Limpieza de FIFOs por dron
     for (int s = 0; s < NUM_ENJAMBRES; s++) {
         for (int i = 0; i < DRONES_POR_ENJAMBRE; i++) {
