@@ -1,6 +1,10 @@
 
 // Incluir stdio.h primero para evitar warnings de printf
 #include <stdio.h>
+#include <sys/stat.h>
+#include <string.h>
+// FIFO global para comunicación de drones al centro de control
+#define FIFO_CENTRO "/tmp/fifo_centro"
 #include <semaphore.h>
 #include <fcntl.h>
 // Nombres de semáforos para sincronización de enjambres
@@ -113,20 +117,39 @@ void proceso_drone(int drone_id, int tipo) {
     for (int i = 0; i < HILOS_COMUNES + 1; i++) {
         pthread_join(hilos[i], NULL);
     }
-    if (tipo == 0)
-        printf("[Drone %d] (Ataque) Todos los hilos finalizaron.\n", drone_id);
-    else
-        printf("[Drone %d] (Cámara) Todos los hilos finalizaron.\n", drone_id);
+    // Enviar mensaje al centro de control por FIFO global
+    int fd = open(FIFO_CENTRO, O_WRONLY);
+    if (fd >= 0) {
+        char msg[128];
+        if (tipo == 0)
+            snprintf(msg, sizeof(msg), "[Drone %d] (Ataque) Todos los hilos finalizaron.\n", drone_id);
+        else
+            snprintf(msg, sizeof(msg), "[Drone %d] (Cámara) Todos los hilos finalizaron.\n", drone_id);
+        write(fd, msg, strlen(msg));
+        close(fd);
+    }
     exit(0);
 }
 
 
-// Hilo para mostrar estado de todos los drones
-void* mostrar_estado(void* arg) {
-    while (1) {
-        printf("[Centro de Control] Mostrando estado de todos los drones...\n");
-        sleep(2);
+// Hilo para leer mensajes de los drones desde el FIFO global
+void* leer_fifo_centro(void* arg) {
+    int fd = open(FIFO_CENTRO, O_RDONLY);
+    if (fd < 0) {
+        perror("[Centro de Control] Error abriendo FIFO_CENTRO para lectura");
+        pthread_exit(NULL);
     }
+    char buffer[256];
+    while (1) {
+        ssize_t n = read(fd, buffer, sizeof(buffer)-1);
+        if (n > 0) {
+            buffer[n] = '\0';
+            printf("[Centro de Control] Mensaje recibido: %s\n", buffer);
+        } else {
+            usleep(100000); // Espera corta para evitar busy wait
+        }
+    }
+    close(fd);
     pthread_exit(NULL);
 }
 
@@ -200,7 +223,13 @@ void proceso_objetivo(int objetivo_id) {
 int main() {
     pid_t enjambre_pids[NUM_ENJAMBRES];
     pid_t objetivo_pids[NUM_OBJETIVOS];
-    pthread_t hilo_estado;
+    pthread_t hilo_lector;
+
+    // Crear FIFO global para comunicación de drones
+    unlink(FIFO_CENTRO);
+    if (mkfifo(FIFO_CENTRO, 0666) < 0) {
+        perror("mkfifo centro");
+    }
 
     // Lanzar procesos de objetivos (artillería)
     for (int i = 0; i < NUM_OBJETIVOS; i++) {
@@ -218,8 +247,8 @@ int main() {
         drone_id += DRONES_POR_ENJAMBRE;
     }
 
-    // Hilo para mostrar estado de todos los drones
-    pthread_create(&hilo_estado, NULL, mostrar_estado, NULL);
+    // Hilo para leer mensajes de los drones
+    pthread_create(&hilo_lector, NULL, leer_fifo_centro, NULL);
 
     // Esperar a que terminen los enjambres
     for (int i = 0; i < NUM_ENJAMBRES; i++) {
@@ -230,9 +259,12 @@ int main() {
         waitpid(objetivo_pids[i], NULL, 0);
     }
 
-    // Cancelar hilo de estado
-    pthread_cancel(hilo_estado);
-    pthread_join(hilo_estado, NULL);
+    // Cancelar hilo de lectura
+    pthread_cancel(hilo_lector);
+    pthread_join(hilo_lector, NULL);
+
+    // Eliminar FIFO global
+    unlink(FIFO_CENTRO);
 
     printf("[Centro de Control] Todos los procesos han terminado.\n");
     return 0;
