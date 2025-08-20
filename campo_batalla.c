@@ -52,20 +52,42 @@ struct Posicion {
     int y;
 };
 
-// Posiciones iniciales
+
+// Posiciones iniciales actualizadas
 struct Posicion camiones[NUM_CAMIONES] = {
-    {0, 25}, // Camion 1
-    {0, 75}, // Camion 2
-    {0, 50}  // Camion 3
+    {25, 0}, // Camion 1
+    {50, 0}, // Camion 2
+    {75, 0}  // Camion 3
 };
 
 struct Posicion objetivos[NUM_OBJETIVOS] = {
-    {0, 25}, // Objetivo 1
+    {0, 25}, // Objetivo 1 (puedes ajustar si lo deseas)
     {0, 50}, // Objetivo 2
     {0, 75}  // Objetivo 3
 };
 
-struct Posicion puesto_control = {0, 100};
+struct Posicion puesto_control = {100, 0};
+
+// Torretas
+#define NUM_TORRETAS 2
+struct Posicion torretas[NUM_TORRETAS] = {
+    {10, 100},
+    {90, 100}
+};
+
+// Zonas
+struct Zona {
+    int y_inicio;
+    int y_fin;
+    char nombre[32];
+};
+
+#define NUM_ZONAS 3
+struct Zona zonas[NUM_ZONAS] = {
+    {0, 33, "Zona de Ensamblaje"},
+    {33, 66, "Zona de Defensa"},
+    {66, 100, "Zona de Reensamblaje"}
+};
 
 
 
@@ -224,6 +246,20 @@ int main() {
     pid_t enjambre_pids[NUM_ENJAMBRES];
     pid_t objetivo_pids[NUM_OBJETIVOS];
     pthread_t hilo_lector;
+
+    // Mostrar configuración inicial
+    printf("\n--- CONFIGURACIÓN DEL CAMPO DE BATALLA ---\n");
+    printf("Centro de Comandos: (%d, %d)\n", puesto_control.x, puesto_control.y);
+    for (int i = 0; i < NUM_CAMIONES; i++) {
+        printf("Camión %d: (%d, %d)\n", i+1, camiones[i].x, camiones[i].y);
+    }
+    for (int i = 0; i < NUM_TORRETAS; i++) {
+        printf("Torreta %d: (%d, %d)\n", i+1, torretas[i].x, torretas[i].y);
+    }
+    for (int i = 0; i < NUM_ZONAS; i++) {
+        printf("%s: y = %d a %d\n", zonas[i].nombre, zonas[i].y_inicio, zonas[i].y_fin);
+    }
+    printf("------------------------------------------\n\n");
 
     // Crear FIFO global para comunicación de drones
     unlink(FIFO_CENTRO);
