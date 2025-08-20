@@ -1,3 +1,19 @@
+// Puntos de destino para los enjambres
+#define NUM_PUNTOS 6
+struct Punto {
+    int x;
+    int y;
+    char descripcion[64];
+};
+
+struct Punto puntos[NUM_PUNTOS] = {
+    {25, 16, "Enjambre 1 - Ensamblaje"},
+    {25, 82, "Enjambre 1 - Reensamblaje"},
+    {50, 16, "Enjambre 2 - Ensamblaje"},
+    {50, 82, "Enjambre 2 - Reensamblaje"},
+    {75, 16, "Enjambre 3 - Ensamblaje"},
+    {75, 82, "Enjambre 3 - Reensamblaje"}
+};
 
 // Incluir stdio.h primero para evitar warnings de printf
 #include <stdio.h>
@@ -258,6 +274,10 @@ int main() {
     }
     for (int i = 0; i < NUM_ZONAS; i++) {
         printf("%s: y = %d a %d\n", zonas[i].nombre, zonas[i].y_inicio, zonas[i].y_fin);
+    }
+    printf("\nPuntos de destino de los enjambres:\n");
+    for (int i = 0; i < NUM_PUNTOS; i++) {
+        printf("Punto %d: (%d, %d) - %s\n", i+1, puntos[i].x, puntos[i].y, puntos[i].descripcion);
     }
     printf("------------------------------------------\n\n");
 
