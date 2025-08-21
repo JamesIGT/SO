@@ -98,6 +98,13 @@ typedef struct {
     int max_fuel;
     int distance_traveled;
     int shoot_down_probability; // Probabilidad individual de derribo
+    
+    // Control de comunicación
+    int communication_active; // Estado de la comunicación (1=activa, 0=perdida)
+    int communication_timeout; // Contador de timeout en décimas de segundo
+    int reestablish_attempts; // Intentos de reestablecimiento
+    time_t last_communication_loss; // Timestamp de última pérdida
+    
     pthread_mutex_t mutex;
     pthread_cond_t condition;
     char fifo_name[64];
@@ -401,6 +408,14 @@ void* drone_navigation_thread(void* arg) {
                         }
                     }
                 }
+                
+                // Verificar si la comunicación está activa antes de continuar navegación
+                if (!drone->communication_active) {
+                    // Si no hay comunicación, pausar la navegación (drone en modo autónomo básico)
+                    // Solo mantiene posición actual, no puede recibir nuevos comandos
+                    break; // Sale del switch, continúa el loop pero sin moverse
+                }
+                
                 break;
         }
         
@@ -438,9 +453,51 @@ void* drone_communication_thread(void* arg) {
     Drone* drone = (Drone*)arg;
     
     while (drone->active && drone->state != DRONE_STATE_DESTROYED && system_state.simulation_running) {
-        // Los drones nunca pierden la comunicación
-        // Solo mantener el hilo activo para sincronización
-        usleep(100000); // 100ms
+        usleep(100000); // 100ms = 1 décima de segundo
+        
+        pthread_mutex_lock(&drone->mutex);
+        
+        // Verificar pérdida de comunicación (Q% de probabilidad) - solo cada segundo
+        static int comm_check_counter = 0;
+        comm_check_counter++;
+        
+        if (drone->communication_active && comm_check_counter >= 10 && check_probability(system_state.Q)) {
+            drone->communication_active = 0;
+            drone->last_communication_loss = time(NULL);
+            drone->communication_timeout = 0;
+            drone->reestablish_attempts = 0;
+            comm_check_counter = 0; // Resetear contador
+            
+            log_message("Drone %d: COMUNICACIÓN PERDIDA", drone->id);
+        }
+        
+        // Si la comunicación está perdida, intentar reestablecerla
+        if (!drone->communication_active) {
+            drone->communication_timeout++;
+            
+            // Verificar si se reestablece (50% de probabilidad cada segundo, no cada décima)
+            if (drone->communication_timeout % 10 == 0 && check_probability(50)) {
+                drone->communication_active = 1;
+                drone->reestablish_attempts++;
+                log_message("Drone %d: COMUNICACIÓN REESTABLECIDA después de %d segundos (intento %d)", 
+                           drone->id, drone->communication_timeout / 10, drone->reestablish_attempts);
+            }
+            
+            // Verificar timeout (Z segundos) - solo mostrar mensaje una vez
+            if (drone->communication_timeout >= system_state.Z * 10 && drone->reestablish_attempts == 0) {
+                log_message("Drone %d: TIMEOUT DE COMUNICACIÓN alcanzado (%d segundos) - DRONE PERDIDO", 
+                           drone->id, system_state.Z);
+                drone->state = DRONE_STATE_DESTROYED;
+                
+                // Enviar evento de drone perdido
+                send_event(EVT_DESTROYED, drone->id, drone->swarm_id, drone->truck_id, "COMM_LOST");
+                
+                pthread_mutex_unlock(&drone->mutex);
+                break;
+            }
+        }
+        
+        pthread_mutex_unlock(&drone->mutex);
     }
     
     return NULL;
@@ -534,6 +591,12 @@ Drone* create_drone(int id, int truck_id, int swarm_id, DroneType type, Position
     drone->shoot_down_probability = rand() % 6; // 0 a 5
     
     drone->active = 1;
+    
+    // Inicializar control de comunicación
+    drone->communication_active = 1; // Inicia con comunicación activa
+    drone->communication_timeout = 0;
+    drone->reestablish_attempts = 0;
+    drone->last_communication_loss = 0;
     
     // Inicializar mutex y condition variable
     pthread_mutex_init(&drone->mutex, NULL);
@@ -1285,7 +1348,10 @@ void command_detonation() {
                             break;
                     }
                     
-                    log_message("  Drone %d (%s): %s", swarm->drones[j]->id, drone_type, drone_status);
+                    // Agregar estado de comunicación
+                    const char* comm_status = swarm->drones[j]->communication_active ? "COMUNICACIÓN ACTIVA" : "COMUNICACIÓN PERDIDA";
+                    
+                    log_message("  Drone %d (%s): %s | %s", swarm->drones[j]->id, drone_type, drone_status, comm_status);
                 }
             }
             pthread_mutex_unlock(&swarm->mutex);
