@@ -203,6 +203,9 @@ typedef struct {
     // Control
     int simulation_running;
     int phase;
+    
+    // Asignación aleatoria de objetivos a enjambres
+    int target_assignments[NUM_TRUCKS];
 } SystemState;
 
 // Variables globales
@@ -619,6 +622,20 @@ void initialize_system() {
     system_state.simulation_running = 1;
     system_state.phase = 1;
     
+    // Asignación aleatoria de objetivos a enjambres (para despistar al enemigo)
+    system_state.target_assignments[0] = rand() % NUM_TARGETS;
+    system_state.target_assignments[1] = rand() % NUM_TARGETS;
+    system_state.target_assignments[2] = rand() % NUM_TARGETS;
+    
+    // Asegurar que no haya conflictos (cada enjambre ataque un objetivo diferente)
+    while (system_state.target_assignments[1] == system_state.target_assignments[0]) {
+        system_state.target_assignments[1] = rand() % NUM_TARGETS;
+    }
+    while (system_state.target_assignments[2] == system_state.target_assignments[0] || 
+           system_state.target_assignments[2] == system_state.target_assignments[1]) {
+        system_state.target_assignments[2] = rand() % NUM_TARGETS;
+    }
+    
     // Crear directorio FIFO
     mkdir(FIFO_PATH, 0777);
     
@@ -677,6 +694,15 @@ void initialize_system() {
     }
     
     log_message("Sistema inicializado correctamente");
+    
+    // Mostrar asignación aleatoria de objetivos
+    log_message("=== ASIGNACIÓN ALEATORIA DE OBJETIVOS ===");
+    for (int i = 0; i < NUM_TRUCKS; i++) {
+        log_message("Enjambre %d → Objetivo %d (Posición: %d,%d)", 
+                   i, system_state.target_assignments[i],
+                   system_state.targets[system_state.target_assignments[i]].pos.x,
+                   system_state.targets[system_state.target_assignments[i]].pos.y);
+    }
 }
 
 // Función para crear enjambres
@@ -832,8 +858,8 @@ void command_global_attack() {
     for (int i = 0; i < system_state.swarm_count; i++) {
         Swarm* swarm = system_state.swarms[i];
         if (swarm && swarm->active_count > 0) {
-            // Los drones van directamente al objetivo final
-            int target_id = i; // Enjambre 0 → Objetivo 0, Enjambre 1 → Objetivo 1, Enjambre 2 → Objetivo 2
+            // Los drones van al objetivo asignado aleatoriamente
+            int target_id = system_state.target_assignments[i];
             for (int j = 0; j < DRONES_PER_SWARM; j++) {
                 if (swarm->drones[j] && 
                     (swarm->drones[j]->state == DRONE_STATE_READY || 
@@ -850,7 +876,7 @@ void command_global_attack() {
                 }
             }
             
-            log_message("Enjambre %d enviado al objetivo final %d", i, target_id);
+            log_message("Enjambre %d asignado al objetivo %d", i, target_id);
         }
     }
     
@@ -1128,8 +1154,17 @@ void command_detonation() {
     // Mostrar estado de cada objetivo
     log_message("=== ESTADO DE LOS OBJETIVOS ===");
     for (int i = 0; i < NUM_TARGETS; i++) {
-        // Cada enjambre ataca UN objetivo específico (enjambre i → objetivo i)
-        Swarm* swarm = system_state.swarms[i];
+        // Buscar qué enjambre ataca este objetivo según las asignaciones aleatorias
+        int attacking_swarm = -1;
+        for (int j = 0; j < system_state.swarm_count; j++) {
+            if (system_state.target_assignments[j] == i) {
+                attacking_swarm = j;
+                break;
+            }
+        }
+        
+        if (attacking_swarm >= 0) {
+            Swarm* swarm = system_state.swarms[attacking_swarm];
         if (swarm && swarm->active_count > 0) {
             int detonated_attack = 0;
             int camera_active = 0;
@@ -1164,10 +1199,13 @@ void command_detonation() {
                 target_status = "INTACTO";
             }
             
-            log_message("Objetivo %d: %s %s (%d drones de ataque detonaron)", 
-                       i, target_status, confirmation_status, detonated_attack);
+            log_message("Objetivo %d: %s %s (%d drones de ataque detonaron) - Atacado por enjambre %d", 
+                       i, target_status, confirmation_status, detonated_attack, attacking_swarm);
         } else {
-            log_message("Objetivo %d: ESTADO DESCONOCIDO (enjambre destruido)", i);
+            log_message("Objetivo %d: ESTADO DESCONOCIDO (enjambre %d destruido)", i, attacking_swarm);
+        }
+        } else {
+            log_message("Objetivo %d: SIN ASIGNAR", i);
         }
     }
     
