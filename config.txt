@@ -1,0 +1,6 @@
+W=30
+Q=10
+Z=4
+speed=2
+fuel=100
+ticks=1000
