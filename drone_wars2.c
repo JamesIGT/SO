@@ -221,6 +221,10 @@ pthread_mutex_t log_mutex;
 
 // Declaraciones de función
 void optimize_drone_distribution();
+void log_phase_header(const char* phase_name);
+void log_sub_phase(const char* sub_phase_name);
+void log_event(const char* event_type, const char* format, ...);
+void log_status(const char* format, ...);
 void fly_in_circles(Drone* drone);
 int try_extract_drones_from_swarm(Swarm* target_swarm, int source_swarm_id, int* needed_attack, int* needed_camera, int target_swarm_id);
 void wait_for_defense_zone_crossing();
@@ -238,9 +242,63 @@ void log_message(const char* format, ...) {
     time_t now = time(NULL);
     struct tm* tm_info = localtime(&now);
     char time_str[26];
-    strftime(time_str, 26, "%Y-%m-%d %H:%M:%S", tm_info);
+    strftime(time_str, 26, "%H:%M:%S", tm_info);
     
     printf("[%s] ", time_str);
+    vprintf(format, args);
+    printf("\n");
+    fflush(stdout);
+    
+    pthread_mutex_unlock(&log_mutex);
+    va_end(args);
+}
+
+// Función para mostrar separadores de fase de manera limpia
+void log_phase_header(const char* phase_name) {
+    pthread_mutex_lock(&log_mutex);
+    printf("\n");
+    printf("╔══════════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                              %-45s ║\n", phase_name);
+    printf("╚══════════════════════════════════════════════════════════════════════════════╝\n");
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
+}
+
+// Función para mostrar sub-fases de manera organizada
+void log_sub_phase(const char* sub_phase_name) {
+    pthread_mutex_lock(&log_mutex);
+    printf("  ┌─ %s\n", sub_phase_name);
+    fflush(stdout);
+    pthread_mutex_unlock(&log_mutex);
+}
+
+// Función para mostrar eventos importantes de manera destacada
+void log_event(const char* event_type, const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    
+    pthread_mutex_lock(&log_mutex);
+    time_t now = time(NULL);
+    struct tm* tm_info = localtime(&now);
+    char time_str[26];
+    strftime(time_str, 26, "%H:%M:%S", tm_info);
+    
+    printf("  │ [%s] [%s] ", time_str, event_type);
+    vprintf(format, args);
+    printf("\n");
+    fflush(stdout);
+    
+    pthread_mutex_unlock(&log_mutex);
+    va_end(args);
+}
+
+// Función para mostrar estado del sistema de manera organizada
+void log_status(const char* format, ...) {
+    va_list args;
+    va_start(args, format);
+    
+    pthread_mutex_lock(&log_mutex);
+    printf("  │ ");
     vprintf(format, args);
     printf("\n");
     fflush(stdout);
@@ -468,7 +526,7 @@ void* drone_communication_thread(void* arg) {
             drone->reestablish_attempts = 0;
             comm_check_counter = 0; // Resetear contador
             
-            log_message("Drone %d: COMUNICACIÓN PERDIDA", drone->id);
+            log_event("COM_LOST", "Drone %d: COMUNICACIÓN PERDIDA", drone->id);
         }
         
         // Si la comunicación está perdida, intentar reestablecerla
@@ -479,14 +537,14 @@ void* drone_communication_thread(void* arg) {
             if (drone->communication_timeout % 10 == 0 && check_probability(50)) {
                 drone->communication_active = 1;
                 drone->reestablish_attempts++;
-                log_message("Drone %d: COMUNICACIÓN REESTABLECIDA después de %d segundos (intento %d)", 
-                           drone->id, drone->communication_timeout / 10, drone->reestablish_attempts);
+                log_event("COM_REST", "Drone %d: COMUNICACIÓN REESTABLECIDA después de %d segundos (intento %d)", 
+                         drone->id, drone->communication_timeout / 10, drone->reestablish_attempts);
             }
             
             // Verificar timeout (Z segundos) - solo mostrar mensaje una vez
             if (drone->communication_timeout >= system_state.Z * 10 && drone->reestablish_attempts == 0) {
-                log_message("Drone %d: TIMEOUT DE COMUNICACIÓN alcanzado (%d segundos) - DRONE PERDIDO", 
-                           drone->id, system_state.Z);
+                log_event("COM_TIMEOUT", "Drone %d: TIMEOUT DE COMUNICACIÓN alcanzado (%d segundos) - DRONE PERDIDO", 
+                         drone->id, system_state.Z);
                 drone->state = DRONE_STATE_DESTROYED;
                 
                 // Enviar evento de drone perdido
@@ -770,7 +828,7 @@ void initialize_system() {
 
 // Función para crear enjambres
 void create_swarms() {
-    log_message("=== FASE 1: CREANDO ENJAMBRES ===");
+    log_sub_phase("Creando enjambres");
     
     for (int i = 0; i < NUM_TRUCKS; i++) {
         int swarm_id = system_state.swarm_count;
@@ -785,7 +843,7 @@ void create_swarms() {
         }
     }
     
-    log_message("Se crearon %d enjambres", system_state.swarm_count);
+    log_status("Se crearon %d enjambres", system_state.swarm_count);
 }
 
 // Función para optimizar la distribución de drones entre enjambres
@@ -1653,42 +1711,46 @@ void command_center() {
     log_message("Centro de Comando iniciado");
     
     // ===== FASE 1: ENSAMBLAJE Y OPTIMIZACIÓN =====
-    log_message("=== INICIANDO FASE 1: ENSAMBLAJE Y OPTIMIZACIÓN ===");
+    log_phase_header("FASE 1: ENSAMBLAJE Y OPTIMIZACIÓN");
     create_swarms();
     
     // Esperar a que todos los enjambres estén listos
+    log_sub_phase("Esperando a que todos los enjambres estén listos");
     wait_for_all_swarms_ready();
     
     // ===== FASE 2: ATAQUE Y CRUCE DE ZONA DE DEFENSA =====
-    log_message("=== INICIANDO FASE 2: ATAQUE Y CRUCE DE ZONA DE DEFENSA ===");
+    log_phase_header("FASE 2: ATAQUE Y CRUCE DE ZONA DE DEFENSA");
     command_global_attack();
     
     // ===== FASE 3: CRUZANDO ZONA DE DEFENSA =====
+    log_phase_header("FASE 3: CRUZANDO ZONA DE DEFENSA");
     wait_for_defense_zone_crossing();
     
     // ===== FASE 4: ATAQUE FINAL =====
-    log_message("=== INICIANDO FASE 4: ATAQUE FINAL ===");
+    log_phase_header("FASE 4: ATAQUE FINAL");
     command_final_attack();
     
     // ===== FASE 4.1: ESPERANDO A QUE TODOS LLEGUEN AL OBJETIVO =====
+    log_sub_phase("Esperando a que todos los drones lleguen al objetivo");
     wait_for_all_drones_at_target();
     
     // ===== FASE 5: DETONACIÓN =====
-    log_message("=== INICIANDO FASE 5: DETONACIÓN ===");
+    log_phase_header("FASE 5: DETONACIÓN");
     command_detonation();
     
     // Esperar a que se complete la detonación
-    log_message("Esperando a que se complete la detonación...");
+    log_sub_phase("Esperando a que se complete la detonación");
     sleep(2);
     
     // Marcar simulación como completada después de la detonación
-    log_message("Simulación completada. Terminando...");
+    log_phase_header("SIMULACIÓN COMPLETADA");
+    log_status("Simulación completada. Terminando...");
     system_state.simulation_running = 0;
     
     // Procesar eventos finales una vez más
     process_events();
     
-    log_message("Centro de Comando finalizado");
+    log_status("Centro de Comando finalizado");
 }
 
 // Función para cargar configuración
