@@ -227,6 +227,7 @@ void log_event(const char* event_type, const char* format, ...);
 void log_status(const char* format, ...);
 void fly_in_circles(Drone* drone);
 int try_extract_drones_from_swarm(Swarm* target_swarm, int source_swarm_id, int* needed_attack, int* needed_camera, int target_swarm_id);
+int try_extract_drones_from_swarm_exclusive(Swarm* target_swarm, int source_swarm_id, int* needed_attack, int* needed_camera, int target_swarm_id, int* drones_reassigned);
 void wait_for_defense_zone_crossing();
 void wait_for_reassembly_ready();
 void command_final_attack();
@@ -423,6 +424,11 @@ void* drone_navigation_thread(void* arg) {
     Drone* drone = (Drone*)arg;
     
     while (drone->active && drone->state != DRONE_STATE_DESTROYED && system_state.simulation_running) {
+        // Verificar si la simulación sigue corriendo ANTES de procesar navegación
+        if (!system_state.simulation_running) {
+            break;
+        }
+        
         pthread_mutex_lock(&drone->mutex);
         
         switch (drone->state) {
@@ -430,7 +436,9 @@ void* drone_navigation_thread(void* arg) {
                 if (calculate_distance(drone->pos, drone->target) <= system_state.speed) {
                     drone->pos = drone->target;
                     drone->state = DRONE_STATE_CIRCLING_ASSEMBLY;
-                    log_message("Drone %d llegó al punto de ensamble, comenzando patrulla circular", drone->id);
+                    if (system_state.simulation_running) {
+                        log_message("Drone %d llegó al punto de ensamble, comenzando patrulla circular", drone->id);
+                    }
                 } else {
                     move_drone_towards(drone, drone->target);
                 }
@@ -445,8 +453,10 @@ void* drone_navigation_thread(void* arg) {
                 if (calculate_distance(drone->pos, drone->target) <= system_state.speed) {
                     drone->pos = drone->target;
                     drone->state = DRONE_STATE_AT_TARGET;
-                    log_message("Drone %d llegó al objetivo (distancia recorrida: %d unidades)", drone->id, drone->distance_traveled);
-                    send_event(EVT_AT_TARGET, drone->id, drone->swarm_id, drone->truck_id, "AT_TARGET");
+                    if (system_state.simulation_running) {
+                        log_message("Drone %d llegó al objetivo (distancia recorrida: %d unidades)", drone->id, drone->distance_traveled);
+                        send_event(EVT_AT_TARGET, drone->id, drone->swarm_id, drone->truck_id, "AT_TARGET");
+                    }
                 } else {
                     move_drone_towards(drone, drone->target);
                     
@@ -459,9 +469,11 @@ void* drone_navigation_thread(void* arg) {
                         (defense_check_counter % 5 == 0)) { // Solo verificar cada 5 ticks (500ms)
                         if (check_probability(drone->shoot_down_probability)) {
                             drone->state = DRONE_STATE_DESTROYED;
-                            log_message("Drone %d derribado por defensas enemigas en zona de defensa (Y=%d)", 
-                                       drone->id, drone->pos.y);
-                            send_event(EVT_DESTROYED, drone->id, drone->swarm_id, drone->truck_id, "SHOT_DOWN");
+                            if (system_state.simulation_running) {
+                                log_message("Drone %d derribado por defensas enemigas en zona de defensa (Y=%d)", 
+                                           drone->id, drone->pos.y);
+                                send_event(EVT_DESTROYED, drone->id, drone->swarm_id, drone->truck_id, "SHOT_DOWN");
+                            }
                             break;
                         }
                     }
@@ -513,6 +525,11 @@ void* drone_communication_thread(void* arg) {
     while (drone->active && drone->state != DRONE_STATE_DESTROYED && system_state.simulation_running) {
         usleep(100000); // 100ms = 1 décima de segundo
         
+        // Verificar si la simulación sigue corriendo ANTES de procesar comunicación
+        if (!system_state.simulation_running) {
+            break;
+        }
+        
         pthread_mutex_lock(&drone->mutex);
         
         // Verificar pérdida de comunicación (Q% de probabilidad) - solo cada segundo
@@ -526,7 +543,10 @@ void* drone_communication_thread(void* arg) {
             drone->reestablish_attempts = 0;
             comm_check_counter = 0; // Resetear contador
             
-            log_event("COM_LOST", "Drone %d: COMUNICACIÓN PERDIDA", drone->id);
+            // Solo loguear si la simulación está activa
+            if (system_state.simulation_running) {
+                log_event("COM_LOST", "Drone %d: COMUNICACIÓN PERDIDA", drone->id);
+            }
         }
         
         // Si la comunicación está perdida, intentar reestablecerla
@@ -537,18 +557,28 @@ void* drone_communication_thread(void* arg) {
             if (drone->communication_timeout % 10 == 0 && check_probability(50)) {
                 drone->communication_active = 1;
                 drone->reestablish_attempts++;
-                log_event("COM_REST", "Drone %d: COMUNICACIÓN REESTABLECIDA después de %d segundos (intento %d)", 
-                         drone->id, drone->communication_timeout / 10, drone->reestablish_attempts);
+                
+                // Solo loguear si la simulación está activa
+                if (system_state.simulation_running) {
+                    log_event("COM_REST", "Drone %d: COMUNICACIÓN REESTABLECIDA después de %d segundos (intento %d)", 
+                             drone->id, drone->communication_timeout / 10, drone->reestablish_attempts);
+                }
             }
             
             // Verificar timeout (Z segundos) - solo mostrar mensaje una vez
             if (drone->communication_timeout >= system_state.Z * 10 && drone->reestablish_attempts == 0) {
-                log_event("COM_TIMEOUT", "Drone %d: TIMEOUT DE COMUNICACIÓN alcanzado (%d segundos) - DRONE PERDIDO", 
-                         drone->id, system_state.Z);
+                // Solo loguear si la simulación está activa
+                if (system_state.simulation_running) {
+                    log_event("COM_TIMEOUT", "Drone %d: TIMEOUT DE COMUNICACIÓN alcanzado (%d segundos) - DRONE PERDIDO", 
+                             drone->id, system_state.Z);
+                }
+                
                 drone->state = DRONE_STATE_DESTROYED;
                 
-                // Enviar evento de drone perdido
-                send_event(EVT_DESTROYED, drone->id, drone->swarm_id, drone->truck_id, "COMM_LOST");
+                // Enviar evento de drone perdido solo si la simulación está activa
+                if (system_state.simulation_running) {
+                    send_event(EVT_DESTROYED, drone->id, drone->swarm_id, drone->truck_id, "COMM_LOST");
+                }
                 
                 pthread_mutex_unlock(&drone->mutex);
                 break;
@@ -566,6 +596,11 @@ void* drone_payload_thread(void* arg) {
     Drone* drone = (Drone*)arg;
     
     while (drone->active && drone->state != DRONE_STATE_DESTROYED && system_state.simulation_running) {
+        // Verificar si la simulación sigue corriendo ANTES de procesar payload
+        if (!system_state.simulation_running) {
+            break;
+        }
+        
         pthread_mutex_lock(&drone->mutex);
         
         if (drone->state == DRONE_STATE_AT_TARGET) {
@@ -573,7 +608,7 @@ void* drone_payload_thread(void* arg) {
                 // Drone de ataque espera comando para detonar
                 // NO detona automáticamente
                 static int logged_attack_drones[100] = {0}; // Array para evitar mensajes repetidos
-                if (!logged_attack_drones[drone->id]) {
+                if (!logged_attack_drones[drone->id] && system_state.simulation_running) {
                     log_message("Drone de ataque %d llegó al objetivo, esperando comando para detonar", drone->id);
                     logged_attack_drones[drone->id] = 1;
                 }
@@ -582,7 +617,7 @@ void* drone_payload_thread(void* arg) {
                 // Drone cámara NO hace reporte automático aquí
                 // Solo espera a que los drones de ataque detonen
                 static int logged_camera_drones[100] = {0}; // Array para evitar mensajes repetidos
-                if (!logged_camera_drones[drone->id]) {
+                if (!logged_camera_drones[drone->id] && system_state.simulation_running) {
                     log_message("Drone cámara %d en posición de vigilancia, esperando detonaciones", drone->id);
                     logged_camera_drones[drone->id] = 1;
                 }
@@ -1144,10 +1179,12 @@ void wait_for_all_drones_at_target() {
     int max_wait_time = 30; // Aumentar tiempo de espera
     int wait_time = 0;
     
-    log_message("Esperando a que todos los drones lleguen al objetivo...");
+    log_message("Esperando a que los drones lleguen al objetivo...");
     
     while (drones_not_at_target > 0 && wait_time < max_wait_time) {
         drones_not_at_target = 0;
+        int total_active_drones = 0;
+        int at_target_count_total = 0;
         
         // Contar drones que aún no han llegado al objetivo
         for (int i = 0; i < system_state.swarm_count; i++) {
@@ -1163,6 +1200,7 @@ void wait_for_all_drones_at_target() {
                     if (swarm->drones[j]) {
                         if (swarm->drones[j]->state == DRONE_STATE_AT_TARGET) {
                             at_target_count++;
+                            at_target_count_total++;
                         } else if (swarm->drones[j]->state == DRONE_STATE_FLYING_TO_TARGET) {
                             flying_count++;
                             drones_not_at_target++;
@@ -1170,6 +1208,10 @@ void wait_for_all_drones_at_target() {
                             destroyed_count++;
                         } else {
                             drones_not_at_target++;
+                        }
+                        
+                        if (swarm->drones[j]->state != DRONE_STATE_DESTROYED) {
+                            total_active_drones++;
                         }
                     }
                 }
@@ -1184,10 +1226,17 @@ void wait_for_all_drones_at_target() {
             }
         }
         
+        // SOLO continuar cuando TODOS los drones activos hayan llegado al objetivo
+        if (total_active_drones > 0 && at_target_count_total == total_active_drones) {
+            break;
+        }
+        
         if (drones_not_at_target > 0) {
             // Solo mostrar mensaje cada 5 segundos para evitar spam
             if (wait_time % 5 == 0) {
-                log_message("Esperando... %d drones aún no han llegado al objetivo", drones_not_at_target);
+                log_message("Esperando... %d drones aún no han llegado al objetivo (%d/%d en objetivo, %.1f%%)", 
+                           drones_not_at_target, at_target_count_total, total_active_drones,
+                           total_active_drones > 0 ? (at_target_count_total * 100.0) / total_active_drones : 0);
             }
             sleep(1);
             wait_time++;
@@ -1197,10 +1246,10 @@ void wait_for_all_drones_at_target() {
     if (wait_time >= max_wait_time) {
         log_message("Tiempo de espera agotado, continuando con detonación...");
     } else {
-        log_message("¡Todos los drones supervivientes han llegado al objetivo!");
+        log_message("¡TODOS los drones han llegado al objetivo! Procediendo con re-ensamblaje...");
     }
     
-    system_state.phase = 5;
+    system_state.phase = 42; // Cambiar a fase de re-ensamblaje
 }
 
 // Función para enviar comando de detonación a todos los drones de ataque
@@ -1217,16 +1266,14 @@ void command_detonation() {
             
             for (int j = 0; j < DRONES_PER_SWARM; j++) {
                 if (swarm->drones[j] && 
-                    swarm->drones[j]->state == DRONE_STATE_AT_TARGET) {
+                    (swarm->drones[j]->state == DRONE_STATE_AT_TARGET || 
+                     swarm->drones[j]->state == DRONE_STATE_REASSEMBLED)) {
                     
                     if (swarm->drones[j]->type == DRONE_TYPE_ATTACK) {
                         // Enviar comando de detonación a drones de ataque
                         swarm->drones[j]->state = DRONE_STATE_DETONATED;
                         log_message("Drone de ataque %d detonó en objetivo", swarm->drones[j]->id);
                         send_event(EVT_DETONATED, swarm->drones[j]->id, swarm->drones[j]->swarm_id, swarm->drones[j]->truck_id, "DETONATED");
-                        
-                        // Marcar drone como detonado (no destruido inmediatamente)
-                        swarm->drones[j]->state = DRONE_STATE_DETONATED;
                         
                     } else if (swarm->drones[j]->type == DRONE_TYPE_CAMERA) {
                         // Drone cámara hace reporte final del estado del objetivo
@@ -1286,45 +1333,45 @@ void command_detonation() {
         
         if (attacking_swarm >= 0) {
             Swarm* swarm = system_state.swarms[attacking_swarm];
-        if (swarm && swarm->active_count > 0) {
-            int detonated_attack = 0;
-            int camera_active = 0;
-            
-            pthread_mutex_lock(&swarm->mutex);
-            
-            // Contar drones de ataque que detonaron en ESTE enjambre
-            for (int k = 0; k < ATTACK_DRONES_PER_SWARM; k++) {
-                if (swarm->drones[k] && swarm->drones[k]->state == DRONE_STATE_DETONATED) {
-                    detonated_attack++;
+            if (swarm && swarm->active_count > 0) {
+                int detonated_attack = 0;
+                int camera_active = 0;
+                
+                pthread_mutex_lock(&swarm->mutex);
+                
+                // Contar drones de ataque que detonaron en ESTE enjambre
+                for (int k = 0; k < ATTACK_DRONES_PER_SWARM; k++) {
+                    if (swarm->drones[k] && swarm->drones[k]->state == DRONE_STATE_DETONATED) {
+                        detonated_attack++;
+                    }
                 }
-            }
-            
-            // Verificar si el drone cámara completó su misión (no fue destruido por torretas)
-            for (int k = ATTACK_DRONES_PER_SWARM; k < DRONES_PER_SWARM; k++) {
-                if (swarm->drones[k] && swarm->drones[k]->state == DRONE_STATE_MISSION_COMPLETE) {
-                    camera_active = 1;
+                
+                // Verificar si el drone cámara completó su misión (no fue destruido por torretas)
+                for (int k = ATTACK_DRONES_PER_SWARM; k < DRONES_PER_SWARM; k++) {
+                    if (swarm->drones[k] && swarm->drones[k]->state == DRONE_STATE_MISSION_COMPLETE) {
+                        camera_active = 1;
+                    }
                 }
-            }
-            
-            pthread_mutex_unlock(&swarm->mutex);
-            
-            // Determinar estado del objetivo
-            const char* target_status;
-            const char* confirmation_status = camera_active ? "CONFIRMADO" : "SIN CONFIRMAR";
-            
-            if (detonated_attack >= 4) {
-                target_status = "DESTRUIDO";
-            } else if (detonated_attack > 0) {
-                target_status = "PARCIALMENTE DESTRUIDO";
+                
+                pthread_mutex_unlock(&swarm->mutex);
+                
+                // Determinar estado del objetivo
+                const char* target_status;
+                const char* confirmation_status = camera_active ? "CONFIRMADO" : "SIN CONFIRMAR";
+                
+                if (detonated_attack >= 4) {
+                    target_status = "DESTRUIDO";
+                } else if (detonated_attack > 0) {
+                    target_status = "PARCIALMENTE DESTRUIDO";
+                } else {
+                    target_status = "INTACTO";
+                }
+                
+                log_message("Objetivo %d: %s %s (%d drones de ataque detonaron) - Atacado por enjambre %d", 
+                           i, target_status, confirmation_status, detonated_attack, attacking_swarm);
             } else {
-                target_status = "INTACTO";
+                log_message("Objetivo %d: ESTADO DESCONOCIDO (enjambre %d destruido)", i, attacking_swarm);
             }
-            
-            log_message("Objetivo %d: %s %s (%d drones de ataque detonaron) - Atacado por enjambre %d", 
-                       i, target_status, confirmation_status, detonated_attack, attacking_swarm);
-        } else {
-            log_message("Objetivo %d: ESTADO DESCONOCIDO (enjambre %d destruido)", i, attacking_swarm);
-        }
         } else {
             log_message("Objetivo %d: SIN ASIGNAR", i);
         }
@@ -1345,19 +1392,26 @@ void command_detonation() {
             // Contar estado de cada dron en el enjambre
             for (int j = 0; j < DRONES_PER_SWARM; j++) {
                 if (swarm->drones[j]) {
-                    if (j < ATTACK_DRONES_PER_SWARM) {
-                        if (swarm->drones[j]->state == DRONE_STATE_DESTROYED) {
+                    if (swarm->drones[j]->state == DRONE_STATE_DESTROYED) {
+                        if (j < ATTACK_DRONES_PER_SWARM) {
                             destroyed_attack++;
-                        } else if (swarm->drones[j]->state == DRONE_STATE_DETONATED) {
-                            destroyed_attack++; // Contar detonados como destruidos para el conteo
                         } else {
-                            attack_drones++;
-                        }
-                    } else {
-                        if (swarm->drones[j]->state == DRONE_STATE_DESTROYED) {
                             destroyed_camera++;
-                        } else if (swarm->drones[j]->state == DRONE_STATE_MISSION_COMPLETE) {
-                            destroyed_camera++; // Contar como "destruido" para el conteo pero era misión completada
+                        }
+                    } else if (swarm->drones[j]->state == DRONE_STATE_DETONATED) {
+                        // Los drones detonados no cuentan como activos
+                        if (j < ATTACK_DRONES_PER_SWARM) {
+                            destroyed_attack++;
+                        }
+                    } else if (swarm->drones[j]->state == DRONE_STATE_MISSION_COMPLETE) {
+                        // Los drones cámara que completaron misión no cuentan como activos
+                        if (j >= ATTACK_DRONES_PER_SWARM) {
+                            destroyed_camera++;
+                        }
+                    } else if (swarm->drones[j]->state != DRONE_STATE_FLYING_TO_TARGET) {
+                        // Solo contar como activos los que no están volando al objetivo
+                        if (j < ATTACK_DRONES_PER_SWARM) {
+                            attack_drones++;
                         } else {
                             camera_drones++;
                         }
@@ -1392,6 +1446,9 @@ void command_detonation() {
                         case DRONE_STATE_AT_TARGET:
                             drone_status = "EN OBJETIVO";
                             break;
+                        case DRONE_STATE_REASSEMBLED:
+                            drone_status = "RE-ENSAMBLADO";
+                            break;
                         case DRONE_STATE_FLYING_TO_TARGET:
                             drone_status = "VOLANDO AL OBJETIVO";
                             break;
@@ -1415,11 +1472,110 @@ void command_detonation() {
             pthread_mutex_unlock(&swarm->mutex);
         }
     }
-    
-    log_message("Estado final de la simulación completado");
 }
 
-// Función auxiliar para extraer drones de un enjambre específico
+// Función auxiliar para extraer drones de un enjambre específico con asignación exclusiva
+int try_extract_drones_from_swarm_exclusive(Swarm* target_swarm, int source_swarm_id, int* needed_attack, int* needed_camera, int target_swarm_id, int* drones_reassigned) {
+    Swarm* source_swarm = system_state.swarms[source_swarm_id];
+    if (!source_swarm) {
+        return 0;
+    }
+    
+    // Verificar si el enjambre fuente está completo (4 ataque + 1 cámara = 5 drones activos)
+    int source_attack_drones = 0;
+    int source_camera_drones = 0;
+    
+    pthread_mutex_lock(&source_swarm->mutex);
+    
+    for (int j = 0; j < DRONES_PER_SWARM; j++) {
+        if (source_swarm->drones[j] && source_swarm->drones[j]->state != DRONE_STATE_DESTROYED) {
+            if (j < ATTACK_DRONES_PER_SWARM) {
+                source_attack_drones++;
+            } else {
+                source_camera_drones++;
+            }
+        }
+    }
+    
+    // Solo extraer de enjambres INCOMPLETOS (regla 1: no extraer de enjambres completos)
+    if (source_attack_drones == ATTACK_DRONES_PER_SWARM && source_camera_drones == 1) {
+        pthread_mutex_unlock(&source_swarm->mutex);
+        return 0; // Es un enjambre completo, no extraer
+    }
+    
+    // Solo extraer drones EXCEDENTES (que no empeoren el enjambre fuente)
+    int excess_attack = 0;
+    int excess_camera = 0;
+    
+    if (source_attack_drones > ATTACK_DRONES_PER_SWARM) {
+        excess_attack = source_attack_drones - ATTACK_DRONES_PER_SWARM;
+    }
+    if (source_camera_drones > 1) {
+        excess_camera = source_camera_drones - 1;
+    }
+    
+    // Si no hay excedentes, no extraer
+    if (excess_attack == 0 && excess_camera == 0) {
+        pthread_mutex_unlock(&source_swarm->mutex);
+        return 0;
+    }
+    
+    pthread_mutex_unlock(&source_swarm->mutex);
+    
+    int drones_extracted = 0;
+    pthread_mutex_lock(&source_swarm->mutex);
+    
+    // Buscar drones disponibles del tipo que necesitamos
+    for (int j = 0; j < DRONES_PER_SWARM && (*needed_attack > 0 || *needed_camera > 0); j++) {
+        if (source_swarm->drones[j] && 
+            source_swarm->drones[j]->state == DRONE_STATE_AT_TARGET &&
+            !drones_reassigned[source_swarm->drones[j]->id]) { // Verificar que no haya sido re-asignado (regla 2)
+            
+            DroneType drone_type = source_swarm->drones[j]->type;
+            
+            if ((drone_type == DRONE_TYPE_ATTACK && *needed_attack > 0 && excess_attack > 0) ||
+                (drone_type == DRONE_TYPE_CAMERA && *needed_camera > 0 && excess_camera > 0)) {
+                
+                // Marcar este drone como re-asignado para evitar conflictos (regla 2)
+                drones_reassigned[source_swarm->drones[j]->id] = 1;
+                
+                // Transferir drone (mantener en estado AT_TARGET ya que está en el objetivo)
+                source_swarm->drones[j]->swarm_id = target_swarm_id;
+                
+                // Encontrar posición vacía en el enjambre destino
+                for (int m = 0; m < DRONES_PER_SWARM; m++) {
+                    if (!target_swarm->drones[m] || target_swarm->drones[m]->state == DRONE_STATE_DESTROYED) {
+                        target_swarm->drones[m] = source_swarm->drones[j];
+                        source_swarm->drones[j] = NULL;
+                        source_swarm->active_count--;
+                        target_swarm->active_count++;
+                        
+                        if (drone_type == DRONE_TYPE_ATTACK) {
+                            (*needed_attack)--;
+                            excess_attack--;
+                        } else {
+                            (*needed_camera)--;
+                            excess_camera--;
+                        }
+                        
+                        drones_extracted++;
+                        
+                        log_message("Drone %d (Tipo: %s) transferido del enjambre %d al enjambre %d", 
+                                   target_swarm->drones[m]->id, 
+                                   drone_type == DRONE_TYPE_ATTACK ? "ATAQUE" : "CÁMARA", 
+                                   source_swarm_id, target_swarm_id);
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    
+    pthread_mutex_unlock(&source_swarm->mutex);
+    return drones_extracted;
+}
+
+// Función auxiliar para extraer drones de un enjambre específico (versión original para compatibilidad)
 int try_extract_drones_from_swarm(Swarm* target_swarm, int source_swarm_id, int* needed_attack, int* needed_camera, int target_swarm_id) {
     Swarm* source_swarm = system_state.swarms[source_swarm_id];
     if (!source_swarm || source_swarm->active_count <= DRONES_PER_SWARM) {
@@ -1472,9 +1628,9 @@ int try_extract_drones_from_swarm(Swarm* target_swarm, int source_swarm_id, int*
 
 // Función para manejar re-ensamblaje
 void handle_reassembly() {
-    log_message("=== FASE 4: MANEJANDO RE-ENSAMBLAJE ===");
+    log_message("=== FASE 4.2: MANEJANDO RE-ENSAMBLAJE ===");
     
-    system_state.phase = 4;
+    system_state.phase = 42;
     
     // Primera pasada: identificar enjambres incompletos y completos
     int incomplete_swarms[MAX_DRONES / DRONES_PER_SWARM];
@@ -1519,6 +1675,15 @@ void handle_reassembly() {
     
     log_message("Enjambres incompletos: %d, Enjambres completos: %d", incomplete_count, complete_count);
     
+    // Si no hay enjambres incompletos, no hay nada que hacer
+    if (incomplete_count == 0) {
+        log_message("Todos los enjambres están completos, no se requiere re-ensamblaje");
+        return;
+    }
+    
+    // Array para marcar drones que ya han sido re-asignados (regla 2: asignación exclusiva)
+    int drones_reassigned[100] = {0}; // Asumiendo máximo 100 drones
+    
     // Segunda pasada: re-ensamblar cada enjambre incompleto de forma independiente
     for (int idx = 0; idx < incomplete_count; idx++) {
         int i = incomplete_swarms[idx];
@@ -1546,25 +1711,33 @@ void handle_reassembly() {
             log_message("Enjambre %d necesita %d drones de ataque y %d drones cámara", 
                        i, needed_attack, needed_camera);
             
-            // Búsqueda alternada: primero enjambres más cercanos, luego más lejanos
+            // Búsqueda alternada entre vecinos izquierda y derecha
             int search_radius = 1;
             int drones_found = 0;
             
-            while (drones_found < (needed_attack + needed_camera) && search_radius < system_state.swarm_count) {
-                // Buscar en enjambres a izquierda y derecha
+            while (drones_found < (needed_attack + needed_camera) && search_radius <= system_state.swarm_count) {
+                // Buscar en enjambres vecinos (izquierda y derecha)
                 int left_swarm = i - search_radius;
                 int right_swarm = i + search_radius;
                 
-                // Verificar límites del array
+                // Buscar a la izquierda
                 if (left_swarm >= 0) {
-                    drones_found += try_extract_drones_from_swarm(swarm, left_swarm, &needed_attack, &needed_camera, i);
+                    log_message("Enjambre %d solicitando drones al enjambre vecino izquierdo %d", i, left_swarm);
+                    drones_found += try_extract_drones_from_swarm_exclusive(swarm, left_swarm, &needed_attack, &needed_camera, i, drones_reassigned);
                 }
                 
+                // Buscar a la derecha
                 if (right_swarm < system_state.swarm_count) {
-                    drones_found += try_extract_drones_from_swarm(swarm, right_swarm, &needed_attack, &needed_camera, i);
+                    log_message("Enjambre %d solicitando drones al enjambre vecino derecho %d", i, right_swarm);
+                    drones_found += try_extract_drones_from_swarm_exclusive(swarm, right_swarm, &needed_attack, &needed_camera, i, drones_reassigned);
                 }
                 
-                search_radius++;
+                // Si no se encontraron drones en los vecinos inmediatos, buscar en enjambres más lejanos
+                if (drones_found == 0) {
+                    search_radius++;
+                } else {
+                    break; // Se encontraron drones, no buscar más lejos
+                }
             }
             
             log_message("Enjambre %d completado con %d drones transferidos", i, drones_found);
@@ -1581,7 +1754,7 @@ void handle_reassembly() {
             pthread_mutex_lock(&swarm->mutex);
             
             for (int j = 0; j < DRONES_PER_SWARM; j++) {
-                if (swarm->drones[j] && swarm->drones[j]->state == DRONE_STATE_READY) {
+                if (swarm->drones[j] && swarm->drones[j]->state == DRONE_STATE_AT_TARGET) {
                     swarm->drones[j]->state = DRONE_STATE_REASSEMBLED;
                 }
             }
@@ -1590,7 +1763,7 @@ void handle_reassembly() {
         }
     }
     
-    log_message("Re-ensamblaje completado, todos los drones están listos para el ataque final");
+    log_message("Re-ensamblaje completado, todos los drones están listos para la detonación");
     
     // Mostrar estado final de cada enjambre
     for (int i = 0; i < system_state.swarm_count; i++) {
@@ -1733,6 +1906,10 @@ void command_center() {
     // ===== FASE 4.1: ESPERANDO A QUE TODOS LLEGUEN AL OBJETIVO =====
     log_sub_phase("Esperando a que todos los drones lleguen al objetivo");
     wait_for_all_drones_at_target();
+    
+    // ===== FASE 4.2: RE-ENSAMBLAJE ANTES DE LA DETONACIÓN =====
+    log_phase_header("FASE 4.2: RE-ENSAMBLAJE ANTES DE LA DETONACIÓN");
+    handle_reassembly();
     
     // ===== FASE 5: DETONACIÓN =====
     log_phase_header("FASE 5: DETONACIÓN");
